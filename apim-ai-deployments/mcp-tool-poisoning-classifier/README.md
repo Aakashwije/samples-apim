@@ -126,9 +126,10 @@ export TOOL_POISONING_API_KEY="$(openssl rand -hex 32)"
 docker compose up --build -d
 ```
 
-Alternatively, copy `.env.example` to `.env` (which is git-ignored) and replace
-the placeholder key. Compose refuses to start when `TOOL_POISONING_API_KEY` is
-unset or empty.
+Alternatively, copy `.env.example` to `.env` (which is git-ignored) and set the
+key there. `.env.example` deliberately leaves it empty: Compose refuses to start
+when `TOOL_POISONING_API_KEY` is unset or empty, so a copy that was never edited
+fails instead of serving with a key published in this repository.
 
 The first build downloads PyTorch and the pinned model, and takes several
 minutes. Then wait for the service to become ready:
@@ -438,7 +439,7 @@ Every setting is an environment variable. Bad values fail at startup.
 | `TOOL_POISONING_ALLOW_DEPENDENCY_DRIFT` | `false` | Start even if the installed stack differs from the model card. |
 | `TOOL_POISONING_MAX_ITEMS` | `32` | Items per request. |
 | `TOOL_POISONING_MAX_TEXT_BYTES` | `100000` | UTF-8 bytes per item. |
-| `TOOL_POISONING_MAX_TOTAL_BYTES` | `1000000` | UTF-8 bytes per request. |
+| `TOOL_POISONING_MAX_TOTAL_BYTES` | `1000000` | UTF-8 bytes of text per request. The raw body is bounded separately at four times this plus 64 KiB, which is refused before the body is parsed — and therefore before authentication — so that JSON structure and escaping still fit while an unbounded body cannot be buffered. |
 | `TOOL_POISONING_MAX_CHUNKS_PER_ITEM` | `24` | Chunk budget per item. |
 | `TOOL_POISONING_CHUNK_OVERLAP_TOKENS` | `64` | Overlap between chunks. |
 | `TOOL_POISONING_MAX_CONCURRENT_REQUESTS` | `4` | In-flight `/classify` requests per replica; beyond this, `503`. |
@@ -496,8 +497,8 @@ Image build arguments:
 - **Supply chain.** The build downloads packages and model files. Build in a
   controlled pipeline, scan the image, push it to a private registry, and deploy
   by digest.
-- **Logging.** Item ids, scores, latency and model identity are logged. Tool
-  metadata text and the API key are not.
+- **Logging.** The item count, latency and model identity are logged per
+  request. Item ids, scores, tool metadata text and the API key are not.
 
 ## Troubleshooting
 
@@ -512,7 +513,7 @@ Image build arguments:
 | Gateway times out or reports the classifier unreachable | Check the endpoint table above, the NetworkPolicy selector, and `request_timeout_millis` against measured latency. Do not add `/classify` to the endpoint. |
 | A newly started Gateway pod is refused for a few seconds | Some network plugins add a new pod's IP to NetworkPolicy allow rules only after a short sync. Requests during that window are refused and `onClassifierError` applies. |
 | Gateway sees `503` under load | Add replicas, or lower `max_concurrent_batches`. |
-| Gateway sees `413` | A field needs more than 24 chunks or exceeds the byte limits. Lower the Gateway's `max_field_bytes`, or raise the service limits and the timeouts together. |
+| Gateway sees `413` | A field needs more than 24 chunks, exceeds the byte limits, or the whole body is past the raw body bound. Lower the Gateway's `max_field_bytes`, or raise the service limits and the timeouts together. |
 
 ## Development
 
@@ -526,8 +527,9 @@ pip install -r requirements-test.txt
 python3 -m pytest -q
 ```
 
-They cover configuration and startup, authentication, every input limit,
-capacity shedding, chunking, model provenance, class-ordering resolution,
+They cover configuration and startup, authentication, every input limit
+including the raw body bound, capacity shedding, chunking, model provenance,
+class-ordering resolution,
 dependency verification, and the consistency of the deployment files. The real
 model is exercised by `scripts/smoke_test.py`.
 

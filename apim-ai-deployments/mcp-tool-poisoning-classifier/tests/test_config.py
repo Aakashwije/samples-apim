@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import pytest
+from conftest import StubClassifier
 
 from tool_poisoning_classifier import config
 from tool_poisoning_classifier.config import (
@@ -25,6 +26,14 @@ from tool_poisoning_classifier.config import (
     Settings,
     load_settings,
 )
+
+# Imported here rather than inside the start-up tests below. main builds the
+# application at import time, and clean_environment has already removed the key
+# by the time a test body runs: a first import from inside one would raise
+# ConfigError before the test could assert anything. Collection happens while
+# conftest's key is still set, so this import succeeds whether the file runs
+# alone or with the rest of the suite.
+from tool_poisoning_classifier.main import create_app
 
 
 @pytest.fixture(autouse=True)
@@ -168,16 +177,11 @@ def test_settings_are_immutable():
 def test_the_application_refuses_to_start_without_authentication():
     # uvicorn builds the app from the environment at import time, so this is
     # the failure a container sees when it is started without a key.
-    from tool_poisoning_classifier.main import create_app
-
     with pytest.raises(ConfigError, match="API_KEY"):
         create_app()
 
 
 def test_the_application_starts_with_an_api_key(monkeypatch):
-    from conftest import StubClassifier
-    from tool_poisoning_classifier.main import create_app
-
     monkeypatch.setenv("TOOL_POISONING_API_KEY", "k")
     app = create_app(classifier=StubClassifier())
 
@@ -186,9 +190,6 @@ def test_the_application_starts_with_an_api_key(monkeypatch):
 
 
 def test_the_application_starts_anonymously_only_when_opted_in(monkeypatch):
-    from conftest import StubClassifier
-    from tool_poisoning_classifier.main import create_app
-
     monkeypatch.setenv("TOOL_POISONING_ALLOW_ANONYMOUS", "true")
     app = create_app(classifier=StubClassifier())
 

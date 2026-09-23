@@ -22,7 +22,12 @@ from conftest import TEST_MODEL, TEST_REVISION, StubClassifier, make_settings
 from fastapi.testclient import TestClient
 
 from tool_poisoning_classifier.classifier import ModelContractError, TextTooLongError
-from tool_poisoning_classifier.main import ConcurrencyLimiter, CapacityExceeded, create_app
+from tool_poisoning_classifier.main import (
+    CapacityExceeded,
+    ConcurrencyLimiter,
+    body_limit_for,
+    create_app,
+)
 
 AUTH = {"Authorization": "Bearer test-key"}
 
@@ -100,6 +105,31 @@ def test_classify_accepts_a_case_insensitive_bearer_scheme():
             test_client,
             [{"id": "a", "text": "hello"}],
             headers={"Authorization": "bearer test-key"},
+        )
+    assert response.status_code == 200
+
+
+def test_a_non_ascii_token_is_refused_rather_than_failing_the_request():
+    # Header bytes above 0x7F decode to a non-ASCII string. Comparing that
+    # string directly raises TypeError, which would answer 500 where the honest
+    # answer is 401.
+    with client() as test_client:
+        response = classify(
+            test_client,
+            [{"id": "a", "text": "hello"}],
+            headers={"Authorization": b"Bearer t\xe9st-key"},
+        )
+    assert response.status_code == 401
+    assert response.headers["WWW-Authenticate"] == "Bearer"
+
+
+def test_a_non_ascii_key_authenticates_on_the_bytes_that_arrived():
+    key = "ключ-🔑"
+    with client(api_key=key) as test_client:
+        response = classify(
+            test_client,
+            [{"id": "a", "text": "hello"}],
+            headers={"Authorization": b"Bearer " + key.encode("utf-8")},
         )
     assert response.status_code == 200
 
@@ -226,6 +256,69 @@ def test_oversized_input_is_rejected_before_any_inference():
     with client(stub, max_text_bytes=10) as test_client:
         classify(test_client, [{"id": "a", "text": "x" * 50}])
     assert stub.calls == []
+
+
+# ── raw body limit ───────────────────────────────────────────────────────────
+#
+# The limits above are enforced on parsed text. These cover the bound that
+# applies to the raw body, before anything is parsed or buffered in full.
+
+JSON = {"Content-Type": "application/json"}
+
+
+def body_of(size: int) -> bytes:
+    return b'{"items": [{"id": "a", "text": "' + b"x" * size + b'"}]}'
+
+
+def test_an_oversized_declared_body_is_refused_before_parsing():
+    stub = StubClassifier()
+    settings = make_settings()
+    with TestClient(create_app(settings=settings, classifier=stub)) as test_client:
+        response = test_client.post(
+            "/classify",
+            content=body_of(body_limit_for(settings) + 1),
+            headers={**AUTH, **JSON},
+        )
+    assert response.status_code == 413
+    assert "request body" in response.json()["detail"]
+    assert stub.calls == []
+
+
+def test_a_body_of_unknown_length_is_counted_as_it_streams():
+    # A chunked body declares no Content-Length, so the same bound has to be
+    # applied to the bytes as they arrive.
+    stub = StubClassifier()
+    settings = make_settings()
+    limit = body_limit_for(settings)
+
+    def chunks():
+        yield b'{"items": [{"id": "a", "text": "'
+        for _ in range(limit // 1024 + 2):
+            yield b"x" * 1024
+        yield b'"}]}'
+
+    with TestClient(create_app(settings=settings, classifier=stub)) as test_client:
+        response = test_client.post(
+            "/classify", content=chunks(), headers={**AUTH, **JSON}
+        )
+    assert response.status_code == 413
+    assert stub.calls == []
+
+
+def test_a_body_within_the_raw_limit_is_still_judged_by_the_text_limits():
+    # The raw bound is deliberately looser than the text limits: a body that
+    # passes it is then measured against max_text_bytes as before.
+    settings = make_settings()
+    assert body_limit_for(settings) > settings.max_total_bytes
+
+    with TestClient(create_app(settings=settings, classifier=StubClassifier())) as test_client:
+        response = test_client.post(
+            "/classify",
+            content=body_of(settings.max_text_bytes + 1),
+            headers={**AUTH, **JSON},
+        )
+    assert response.status_code == 413
+    assert "per-item limit" in response.json()["detail"]
 
 
 # ── failure modes ────────────────────────────────────────────────────────────

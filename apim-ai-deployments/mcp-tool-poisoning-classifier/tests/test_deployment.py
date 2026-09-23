@@ -114,9 +114,11 @@ def test_compose_requires_the_api_key_and_never_enables_anonymous_access():
     assert "ALLOW_ANONYMOUS" not in compose
 
 
-def test_the_env_example_holds_placeholders_only():
+def test_the_env_example_ships_no_credential():
+    # A placeholder value would satisfy Compose's ${...:?} check, so an unedited
+    # copy of this file would start the service with a key published here.
     values = dict(line.split("=", 1) for line in code_lines(".env.example"))
-    assert values["TOOL_POISONING_API_KEY"] == "replace-with-generated-secret"
+    assert values["TOOL_POISONING_API_KEY"] == ""
     assert "TOOL_POISONING_ALLOW_ANONYMOUS" not in values
 
 

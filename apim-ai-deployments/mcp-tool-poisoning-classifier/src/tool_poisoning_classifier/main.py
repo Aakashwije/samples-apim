@@ -60,9 +60,126 @@ LOGGER = logging.getLogger(__name__)
 HTTP_CONTENT_TOO_LARGE = 413
 HTTP_UNPROCESSABLE_CONTENT = 422
 
+# How much raw body a request may carry, derived from the text limit. The
+# per-item and per-batch limits are enforced on parsed text, which is already
+# buffered and decoded by the time they run; this bounds what the process
+# buffers before it can parse anything at all. Deliberately generous: JSON
+# structure, and escaping that can turn one byte of text into six, are
+# legitimate overhead, and the exact limits are still applied after parsing.
+BODY_LIMIT_MULTIPLIER = 4
+BODY_LIMIT_HEADROOM_BYTES = 64 * 1024
+
 
 class CapacityExceeded(Exception):
     """Raised when the service is already serving its maximum request count."""
+
+
+def body_limit_for(settings: Settings) -> int:
+    """The largest raw request body the service will read."""
+    return settings.max_total_bytes * BODY_LIMIT_MULTIPLIER + BODY_LIMIT_HEADROOM_BYTES
+
+
+class BodySizeLimitMiddleware:
+    """Refuse an oversized request body before anything parses it.
+
+    A declared Content-Length above the limit is refused without reading the
+    body at all. A body of unknown length — chunked, as an HTTP/1.1 client may
+    send — is read here instead, counted as it arrives and abandoned at the same
+    bound, so an undeclared length cannot walk past the limit.
+    """
+
+    def __init__(self, app, max_bytes: int) -> None:
+        self._app = app
+        self._max_bytes = max_bytes
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http":
+            await self._app(scope, receive, send)
+            return
+
+        declared = self._declared_length(scope)
+        if declared is not None:
+            if declared > self._max_bytes:
+                await self._refuse(send)
+                return
+            # The server holds the client to the length it declared, so the body
+            # is already bounded by the check above: stream it straight through.
+            await self._app(scope, receive, send)
+            return
+
+        body, within_limit = await self._read_bounded(receive)
+        if not within_limit:
+            await self._refuse(send)
+            return
+        await self._app(scope, _replay(body), send)
+
+    async def _read_bounded(self, receive) -> tuple[list[dict], bool]:
+        """Read the body messages, stopping as soon as they pass the limit.
+
+        Reading here costs one buffer of at most the limit, which is the point:
+        without it the application buffers a body of unbounded size before any
+        limit can apply. The messages are returned rather than the bytes so the
+        application still sees the request exactly as it arrived.
+        """
+        messages: list[dict] = []
+        read = 0
+        while True:
+            message = await receive()
+            messages.append(message)
+            if message["type"] != "http.request":
+                # A disconnect: handing it on lets the application notice.
+                return messages, True
+            read += len(message.get("body", b""))
+            if read > self._max_bytes:
+                return messages, False
+            if not message.get("more_body", False):
+                return messages, True
+
+    def _declared_length(self, scope) -> int | None:
+        for name, value in scope.get("headers", ()):
+            if name == b"content-length":
+                try:
+                    return int(value)
+                except ValueError:
+                    # Malformed: left to the server and the parser to reject.
+                    return None
+        return None
+
+    async def _refuse(self, send) -> None:
+        response = JSONResponse(
+            status_code=HTTP_CONTENT_TOO_LARGE,
+            content={
+                "detail": (
+                    "the request body exceeds the limit of "
+                    f"{self._max_bytes} bytes"
+                )
+            },
+        )
+        await send(
+            {
+                "type": "http.response.start",
+                "status": response.status_code,
+                "headers": response.raw_headers,
+            }
+        )
+        await send({"type": "http.response.body", "body": response.body})
+
+
+def _replay(messages: list[dict]):
+    """A receive callable that hands back already-read messages, then silence.
+
+    The body has been read to its end by the time this is built, so the
+    application never asks for more than the queue holds; a further call means
+    the caller is gone.
+    """
+    queue = list(messages)
+
+    async def replayed() -> dict:
+        if queue:
+            return queue.pop(0)
+        return {"type": "http.disconnect"}
+
+    return replayed
 
 
 class ConcurrencyLimiter:
@@ -127,6 +244,13 @@ def create_app(
     app.state.settings = settings
     app.state.classifier = model
     app.state.limiter = limiter
+    app.add_middleware(BodySizeLimitMiddleware, max_bytes=body_limit_for(settings))
+
+    # Encoded once: hmac.compare_digest accepts str only when both arguments are
+    # ASCII, so a key with any other character has to be compared as bytes.
+    # surrogateescape mirrors how the environment was decoded, keeping a key
+    # that is not valid UTF-8 from raising here.
+    expected_token = settings.api_key.encode("utf-8", "surrogateescape")
 
     def require_auth(
         authorization: Annotated[str | None, Header()] = None,
@@ -147,7 +271,11 @@ def create_app(
                 headers={"WWW-Authenticate": "Bearer"},
             )
         # Constant-time: a timing-distinguishable comparison leaks the key.
-        if not hmac.compare_digest(token, settings.api_key):
+        # Compared as bytes, and as the bytes that arrived: Starlette decodes
+        # header values as latin-1, so encoding the token back that way recovers
+        # them. Comparing the str directly would raise TypeError on any byte
+        # above 0x7F and answer 500 where the answer is 401.
+        if not hmac.compare_digest(token.encode("latin-1", "replace"), expected_token):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="invalid token",

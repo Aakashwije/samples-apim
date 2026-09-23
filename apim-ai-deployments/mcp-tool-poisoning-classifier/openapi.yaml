@@ -79,6 +79,8 @@ paths:
             An item exceeds TOOL_POISONING_MAX_TEXT_BYTES, the request exceeds
             TOOL_POISONING_MAX_TOTAL_BYTES, or an item needs more than
             TOOL_POISONING_MAX_CHUNKS_PER_ITEM chunks. Nothing is truncated.
+            A raw body far above TOOL_POISONING_MAX_TOTAL_BYTES is refused
+            before it is parsed, and therefore before authentication.
           content:
             application/json:
               schema:
